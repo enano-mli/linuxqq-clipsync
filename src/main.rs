@@ -161,6 +161,28 @@ fn get_xdg_runtime_dir() -> String {
     format!("/run/user/{}", unsafe { libc::getuid() })
 }
 
+// CLIPSYNC_DEBUG=1 时输出剪贴板原始字节前缀，用于排查编码类问题
+fn debug_enabled() -> bool {
+    static DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DEBUG.get_or_init(|| env::var("CLIPSYNC_DEBUG").unwrap_or_default() == "1")
+}
+
+fn debug_dump(tag: &str, types: &str, data: &[u8]) {
+    if !debug_enabled() {
+        return;
+    }
+    let hex: String = data
+        .iter()
+        .take(48)
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let clean_types: Vec<&str> = types.lines().map(str::trim).filter(|s| !s.is_empty()).collect();
+    log(
+        "DEBUG",
+        &format!("[{tag}] types=[{}] len={} head={hex}", clean_types.join(","), data.len()),
+    );
+}
+
 // png → BMP3（wine CF_DIB 需要）。CLIPSYNC_BMP_CONV=magick 时切回
 // ImageMagick 管道（与旧企微桥行为逐字节一致的保底路径）。
 fn make_bmp(png: &[u8]) -> Option<Vec<u8>> {
@@ -340,19 +362,22 @@ fn main() {
             let types_str = String::from_utf8_lossy(&types_raw);
 
             let (source_mime, sync_mime, process_mode) =
-                if types_str.contains("x-special/gnome-copied-files") {
-                    ("x-special/gnome-copied-files", "text/uri-list", "uri-list")
-                } else if types_str.contains("application/x-qt-image")
-                    || types_str.contains("text/uri-list")
-                {
-                    ("text/uri-list", "text/uri-list", "uri-list")
-                } else if types_str.contains("image/png") {
+                // 图片优先于 uri-list：QQ 等应用复制图片时同时提供临时文件路径
+                // (uri-list) 和图像本体，若先匹配 uri-list 会把"复制图片"变成
+                // "复制路径"（wine 还会优先拿 uri-list 映射成 HDROP 文件粘贴）
+                if types_str.contains("image/png") {
                     ("image/png", "image/png", "raw")
                 } else if types_str.contains("image/jpeg") {
                     ("image/jpeg", "image/jpeg", "raw")
                 } else if types_str.contains("image/bmp") {
                     // 企微（wine）复制的 bmp：转 png 后再同步到 Wayland
                     ("image/bmp", "image/png", "bmp")
+                } else if types_str.contains("x-special/gnome-copied-files") {
+                    ("x-special/gnome-copied-files", "text/uri-list", "uri-list")
+                } else if types_str.contains("application/x-qt-image")
+                    || types_str.contains("text/uri-list")
+                {
+                    ("text/uri-list", "text/uri-list", "uri-list")
                 } else if types_str.contains("text/plain;charset=utf-8") {
                     ("text/plain;charset=utf-8", "text/plain", "text")
                 } else if types_str.contains("UTF8_STRING") {
@@ -366,6 +391,7 @@ fn main() {
                 };
 
             let x_data = read_clipboard("xclip", &["-sel", "clip", "-o", "-t", source_mime]);
+            debug_dump("X2W-read", &types_str, &x_data);
             // bmp → png 转换放在 hash 之前：hash 落在转换产物上，
             // W2X 后续读到同一 png 时 hash 命中、不会二次回写
             let x_data = if process_mode == "bmp" {
@@ -466,15 +492,17 @@ fn main() {
         let types_raw = read_clipboard("wl-paste", &["--list-types"]);
         let types_str = String::from_utf8_lossy(&types_raw);
 
-        let (sync_mime, process_mode) = if types_str.contains("application/x-qt-image")
-            || types_str.contains("text/uri-list")
-        {
-            ("text/uri-list", "uri-list")
-        } else if types_str.contains("image/png") {
-            ("image/png", "raw")
-        } else if types_str.contains("image/jpeg") {
-            ("image/jpeg", "raw")
-        } else if types_str.contains("text/plain;charset=utf-8") {
+        let (sync_mime, process_mode) =
+            // 与 X2W 同理：图像本体优先于 uri-list（临时文件路径）
+            if types_str.contains("image/png") {
+                ("image/png", "raw")
+            } else if types_str.contains("image/jpeg") {
+                ("image/jpeg", "raw")
+            } else if types_str.contains("application/x-qt-image")
+                || types_str.contains("text/uri-list")
+            {
+                ("text/uri-list", "uri-list")
+            } else if types_str.contains("text/plain;charset=utf-8") {
             ("text/plain;charset=utf-8", "text")
         } else if types_str.contains("text/plain") {
             ("text/plain", "text")
@@ -485,6 +513,7 @@ fn main() {
         };
 
         let w_data = read_clipboard("wl-paste", &["-n", "-t", sync_mime]);
+        debug_dump("W2X-read", &types_str, &w_data);
         let current_hash = calc_hash(&w_data, process_mode);
         if current_hash == EMPTY_HASH {
             continue;

@@ -116,7 +116,13 @@ struct OwnerThread {
     atom_timestamp: Atom,
     atom_atom: Atom,
     atom_incr: Atom,
+    atom_png: Atom,
+    atom_bmp: Atom,
+    atom_urilist: Atom,
+    atom_wm_class: Atom,
     interned: HashMap<String, Atom>,
+    /// 请求方窗口 → 是否 wine 客户端（按 WM_CLASS 识别，缓存）
+    wine_cache: HashMap<u32, bool>,
     dummy_prop: Atom,
     payload: Option<Payload>,
     pending: Vec<PendingIncr>,
@@ -155,7 +161,12 @@ impl OwnerThread {
             atom_timestamp: 0,
             atom_atom: AtomEnum::ATOM.into(),
             atom_incr: 0,
+            atom_png: 0,
+            atom_bmp: 0,
+            atom_urilist: 0,
+            atom_wm_class: 0,
             interned: HashMap::new(),
+            wine_cache: HashMap::new(),
             dummy_prop: 0,
             payload: None,
             pending: Vec::new(),
@@ -166,6 +177,10 @@ impl OwnerThread {
         t.atom_targets = t.intern("TARGETS")?;
         t.atom_timestamp = t.intern("TIMESTAMP")?;
         t.atom_incr = t.intern("INCR")?;
+        t.atom_png = t.intern("image/png")?;
+        t.atom_bmp = t.intern("image/bmp")?;
+        t.atom_urilist = t.intern("text/uri-list")?;
+        t.atom_wm_class = t.intern("WM_CLASS")?;
         t.dummy_prop = t.intern("CLIPSYNC_TS")?;
 
         // INCR 分块：不超过服务器最大请求长度，留协议头余量
@@ -375,22 +390,43 @@ impl OwnerThread {
         // ICCCM：property=None 时以 target 原子作为属性名（xclip 等客户端的惯例）
         let property = if e.property == 0 { e.target } else { e.property };
 
-        let Some(p) = self.payload.as_ref() else {
+        // 一次性提取所需数据并结束不可变借用（后续要调用 &mut self 的方法）
+        let payload_info = self.payload.as_ref().map(|p| {
+            (
+                p.atoms.clone(),
+                p.acquired_at,
+                p.data.get(&e.target).cloned(),
+                p.data.contains_key(&self.atom_png) && p.data.contains_key(&self.atom_bmp),
+            )
+        });
+        let Some((atoms_list, acquired_at, target_data, has_dual)) = payload_info else {
             // 已不持有：拒绝
             self.notify(e.requestor, e.selection, e.target, 0, e.time);
             return;
         };
 
         // TARGETS / TIMESTAMP 元 target
-        let meta = if e.target == self.atom_targets {
-            Some((self.atom_atom, p.atoms.clone()))
-        } else if e.target == self.atom_timestamp {
-            Some((self.atom_timestamp, vec![p.acquired_at]))
-        } else {
-            None
-        };
-        if let Some((ptype, words)) = meta {
-            let ok = self.prop32(e.requestor, property, ptype, &words);
+        if e.target == self.atom_targets {
+            // wine（企微/微信）按 WM_CLASS 识别（res_class 形如 "Wxwork.exe"）。
+            // wine 的格式优先级：image/png → 自定义 "PNG" 格式（应用不认），
+            // text/uri-list → HDROP 文件粘贴，都会抢在 image/bmp(CF_DIB) 之前。
+            // 因此对 wine 隐藏 png 和 uri-list，只让它看到 bmp 和文本 target
+            // （仅在 bmp 确实可用时过滤，否则保留 png 兜底）。
+            let mut atoms = atoms_list;
+            if has_dual && self.requestor_is_wine(e.requestor) {
+                let before = atoms.len();
+                atoms.retain(|a| *a != self.atom_png && *a != self.atom_urilist);
+                log(
+                    "X11-Owner",
+                    &format!(
+                        "wine 请求方 0x{:x}：TARGETS 过滤 {}→{}（隐藏 png/uri-list，保 bmp）",
+                        e.requestor,
+                        before,
+                        atoms.len()
+                    ),
+                );
+            }
+            let ok = self.prop32(e.requestor, property, self.atom_atom, &atoms);
             let _ = self.conn.flush();
             log(
                 "X11-Owner",
@@ -410,9 +446,21 @@ impl OwnerThread {
             );
             return;
         }
+        if e.target == self.atom_timestamp {
+            let ok = self.prop32(e.requestor, property, self.atom_timestamp, &[acquired_at]);
+            let _ = self.conn.flush();
+            self.notify(
+                e.requestor,
+                e.selection,
+                e.target,
+                if ok { property } else { 0 },
+                e.time,
+            );
+            return;
+        }
 
         // 数据 target：只服务已列出的（ICCCM 合规拒绝，请求方回退其他格式）
-        let Some(data) = p.data.get(&e.target).cloned() else {
+        let Some(data) = target_data else {
             log(
                 "X11-Owner",
                 &format!(
@@ -476,6 +524,31 @@ impl OwnerThread {
                 self.notify(e.requestor, e.selection, e.target, 0, e.time);
             }
         }
+    }
+
+    /// 请求方是否 wine 客户端：读其窗口 WM_CLASS（形如 "wxwork\0Wxwork.exe"），
+    /// 结果缓存。wine 的所有窗口 res_class 均带 .exe 后缀。
+    fn requestor_is_wine(&mut self, win: u32) -> bool {
+        if let Some(&v) = self.wine_cache.get(&win) {
+            return v;
+        }
+        let any_type: Atom = AtomEnum::ANY.into();
+        let class = self
+            .conn
+            .get_property(false, win, self.atom_wm_class, any_type, 0, 64)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .map(|r| String::from_utf8_lossy(&r.value).to_lowercase())
+            .unwrap_or_default();
+        let is_wine = class.contains(".exe") || class.contains("wine");
+        if !class.is_empty() {
+            log(
+                "X11-Owner",
+                &format!("请求方 0x{win:x} WM_CLASS=\"{class}\" wine={is_wine}"),
+            );
+        }
+        self.wine_cache.insert(win, is_wine);
+        is_wine
     }
 
     fn atom_name(&self, atom: Atom) -> String {
