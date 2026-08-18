@@ -11,9 +11,11 @@
 // （wine → UTF8_STRING）。大负载走 INCR 流式传输。
 
 use std::collections::HashMap;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::fs::File;
+use std::io::Write;
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::Duration;
 
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::errors::ConnectionError;
@@ -47,32 +49,47 @@ struct PendingIncr {
 
 pub struct X11Owner {
     tx: Sender<OwnerCmd>,
+    /// 写端唤醒管道：命令入队后唤醒阻塞在 poll 上的事件线程
+    wake: File,
 }
 
 impl X11Owner {
     /// 连接 DISPLAY 并启动持有者事件线程。失败返回 None，调用方回退 xclip 路径。
     pub fn spawn() -> Option<X11Owner> {
         let (tx, rx) = mpsc::channel();
+        let mut fds = [0i32; 2];
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } != 0 {
+            return None;
+        }
+        let (rfd, wfd) = (fds[0], fds[1]);
         thread::Builder::new()
             .name("x11-owner".into())
-            .spawn(move || match OwnerThread::new() {
+            .spawn(move || match OwnerThread::new(rfd) {
                 Some(t) => t.run(rx),
                 None => log("WARN", "x11 持有者线程启动失败，W2X 将回退 xclip"),
             })
             .ok()?;
-        Some(X11Owner { tx })
+        Some(X11Owner {
+            tx,
+            wake: unsafe { File::from_raw_fd(wfd) },
+        })
     }
 
     /// 非阻塞断言所有权；线程已死（发送失败）时返回 false，调用方回退 xclip。
     pub fn assert(&self, targets: Vec<(&str, Vec<u8>)>) -> bool {
-        self.tx
+        let sent = self
+            .tx
             .send(OwnerCmd::Assert(
                 targets
                     .into_iter()
                     .map(|(n, d)| (n.to_string(), d))
                     .collect(),
             ))
-            .is_ok()
+            .is_ok();
+        if sent {
+            let _ = (&self.wake).write(&[1]);
+        }
+        sent
     }
 }
 
@@ -93,6 +110,7 @@ fn le_words(words: &[u32]) -> Vec<u8> {
 struct OwnerThread {
     conn: RustConnection,
     win: u32,
+    wake_fd: RawFd,
     atom_clipboard: Atom,
     atom_targets: Atom,
     atom_timestamp: Atom,
@@ -107,7 +125,7 @@ struct OwnerThread {
 }
 
 impl OwnerThread {
-    fn new() -> Option<OwnerThread> {
+    fn new(wake_fd: RawFd) -> Option<OwnerThread> {
         let (conn, screen_num) = RustConnection::connect(None).ok()?;
         let win = conn.generate_id().ok()?;
         let root = conn.setup().roots.get(screen_num)?.root;
@@ -131,6 +149,7 @@ impl OwnerThread {
         let mut t = OwnerThread {
             conn,
             win,
+            wake_fd,
             atom_clipboard: 0,
             atom_targets: 0,
             atom_timestamp: 0,
@@ -201,32 +220,55 @@ impl OwnerThread {
 
     fn run(mut self, rx: Receiver<OwnerCmd>) {
         log("INFO", "=== [X11-Owner] 持有者线程就绪 ===");
+        let xfd = self.conn.stream().as_raw_fd();
         loop {
-            // 先排空命令，再处理事件；无事件时轻量等待命令
+            // 1) 处理待处理命令
             loop {
                 match rx.try_recv() {
                     Ok(OwnerCmd::Assert(targets)) => self.begin_assert(targets),
                     Err(_) => break,
                 }
             }
-            match self.conn.poll_for_event() {
-                Ok(Some(ev)) => self.handle_event(ev),
-                Ok(None) => match rx.recv_timeout(Duration::from_millis(200)) {
-                    Ok(OwnerCmd::Assert(targets)) => self.begin_assert(targets),
-                    Err(RecvTimeoutError::Timeout) => continue,
-                    Err(RecvTimeoutError::Disconnected) => {
-                        log("INFO", "[X11-Owner] 命令通道关闭，线程退出");
-                        return;
-                    }
-                },
-                Err(ConnectionError::IoError(e)) => {
+            // 2) 处理所有已到达事件（poll_for_event 会非阻塞读 socket）
+            let mut had_error = false;
+            while let Ok(Some(ev)) = self.conn.poll_for_event() {
+                self.handle_event(ev);
+            }
+            if let Err(e) = self.conn.poll_for_event() {
+                if matches!(e, ConnectionError::IoError(_)) {
                     log("WARN", &format!("[X11-Owner] X 连接断开: {e}，线程退出"));
                     return;
                 }
-                Err(e) => {
-                    log("WARN", &format!("[X11-Owner] 事件读取异常: {e}"));
-                    thread::sleep(Duration::from_millis(50));
-                }
+                had_error = true;
+            }
+            if had_error {
+                // 短暂退避避免错误风暴
+                thread::sleep(std::time::Duration::from_millis(50));
+            }
+            // 3) 阻塞等待 X socket 或唤醒管道（关键：应答延迟必须为毫秒级，
+            //    xclip 等客户端等待 SelectionNotify 的窗口只有几十毫秒）
+            let mut fds = [
+                libc::pollfd {
+                    fd: xfd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: self.wake_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            let r = unsafe { libc::poll(fds.as_mut_ptr(), 2, 60_000) };
+            if r < 0 {
+                // EINTR 等信号打断，直接重试
+                continue;
+            }
+            if fds[1].revents & (libc::POLLIN as i16) != 0 {
+                let mut buf = [0u8; 64];
+                let _ = unsafe {
+                    libc::read(self.wake_fd, buf.as_mut_ptr().cast(), buf.len())
+                };
             }
         }
     }
