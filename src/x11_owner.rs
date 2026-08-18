@@ -524,17 +524,20 @@ impl OwnerThread {
 
     /// SelectionNotify：property=0 表示拒绝
     fn notify(&mut self, requestor: u32, selection: Atom, target: Atom, property: Atom, time: u32) {
-        // 手工序列化为 32 字节事件包，SendEvent 直接投给请求方客户端
-        let mut buf = [0u8; 32];
-        buf[0] = SELECTION_NOTIFY_EVENT;
-        buf[4..8].copy_from_slice(&requestor.to_ne_bytes());
-        buf[8..12].copy_from_slice(&selection.to_ne_bytes());
-        buf[12..16].copy_from_slice(&target.to_ne_bytes());
-        buf[16..20].copy_from_slice(&property.to_ne_bytes());
-        buf[20..24].copy_from_slice(&time.to_ne_bytes());
+        // 注意：SelectionNotify 线格式字段顺序是 time/requestor/selection/target/property，
+        // 与其他事件不同，必须用 x11rb 官方序列化（手写顺序踩过坑）
+        let ev = SelectionNotifyEvent {
+            response_type: SELECTION_NOTIFY_EVENT,
+            sequence: 0,
+            requestor,
+            selection,
+            target,
+            property,
+            time,
+        };
         if self
             .conn
-            .send_event(false, requestor, EventMask::NO_EVENT, buf)
+            .send_event(false, requestor, EventMask::NO_EVENT, ev)
             .is_ok()
         {
             let _ = self.conn.flush();
