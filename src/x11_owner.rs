@@ -317,10 +317,16 @@ impl OwnerThread {
     }
 
     fn handle_request(&mut self, e: x11rb::protocol::xproto::SelectionRequestEvent) {
-        if e.selection != self.atom_clipboard || e.property == 0 {
+        if e.selection != self.atom_clipboard {
+            log(
+                "X11-Owner",
+                &format!("拒绝非 CLIPBOARD 请求 target=0x{:x}", e.target),
+            );
             self.notify(e.requestor, e.selection, e.target, 0, e.time);
             return;
         }
+        // ICCCM：property=None 时以 target 原子作为属性名（xclip 等客户端的惯例）
+        let property = if e.property == 0 { e.target } else { e.property };
 
         let Some(p) = self.payload.as_ref() else {
             // 已不持有：拒绝
@@ -337,13 +343,22 @@ impl OwnerThread {
             None
         };
         if let Some((ptype, words)) = meta {
-            let ok = self.prop32(e.requestor, e.property, ptype, &words);
+            let ok = self.prop32(e.requestor, property, ptype, &words);
             let _ = self.conn.flush();
+            log(
+                "X11-Owner",
+                &format!(
+                    "元请求 {} → 0x{:x} {}",
+                    self.atom_name(e.target),
+                    e.requestor,
+                    if ok { "已应答" } else { "写入失败" }
+                ),
+            );
             self.notify(
                 e.requestor,
                 e.selection,
                 e.target,
-                if ok { e.property } else { 0 },
+                if ok { property } else { 0 },
                 e.time,
             );
             return;
@@ -351,18 +366,35 @@ impl OwnerThread {
 
         // 数据 target：只服务已列出的（ICCCM 合规拒绝，请求方回退其他格式）
         let Some(data) = p.data.get(&e.target).cloned() else {
+            log(
+                "X11-Owner",
+                &format!(
+                    "拒绝未提供的目标 {} → 0x{:x}",
+                    self.atom_name(e.target),
+                    e.requestor
+                ),
+            );
             self.notify(e.requestor, e.selection, e.target, 0, e.time);
             return;
         };
 
         if data.len() <= self.chunk {
-            let ok = self.prop8(e.requestor, e.property, e.target, &data);
+            let ok = self.prop8(e.requestor, property, e.target, &data);
             let _ = self.conn.flush();
+            log(
+                "X11-Owner",
+                &format!(
+                    "直传 {} {} 字节 → 0x{:x}",
+                    self.atom_name(e.target),
+                    data.len(),
+                    e.requestor
+                ),
+            );
             self.notify(
                 e.requestor,
                 e.selection,
                 e.target,
-                if ok { e.property } else { 0 },
+                if ok { property } else { 0 },
                 e.time,
             );
         } else {
@@ -374,30 +406,49 @@ impl OwnerThread {
                     &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
                 )
                 .is_ok();
-            let declared = self.prop32(
-                e.requestor,
-                e.property,
-                self.atom_incr,
-                &[data.len() as u32],
-            );
+            let declared = self.prop32(e.requestor, property, self.atom_incr, &[data.len() as u32]);
             let _ = self.conn.flush();
             if ok && declared {
                 log(
                     "X11-Owner",
-                    &format!("INCR 传输开始: {} 字节 → 0x{:x}", data.len(), e.requestor),
+                    &format!(
+                        "INCR 传输开始: {} 字节 → 0x{:x}",
+                        data.len(),
+                        e.requestor
+                    ),
                 );
                 self.pending.push(PendingIncr {
                     requestor: e.requestor,
-                    property: e.property,
+                    property,
                     target_type: e.target,
                     data,
                     offset: 0,
                 });
-                self.notify(e.requestor, e.selection, e.target, e.property, e.time);
+                self.notify(e.requestor, e.selection, e.target, property, e.time);
             } else {
                 self.notify(e.requestor, e.selection, e.target, 0, e.time);
             }
         }
+    }
+
+    fn atom_name(&self, atom: Atom) -> String {
+        let known = [
+            (self.atom_targets, "TARGETS"),
+            (self.atom_timestamp, "TIMESTAMP"),
+            (self.atom_incr, "INCR"),
+            (self.atom_clipboard, "CLIPBOARD"),
+        ];
+        for (a, n) in known {
+            if a == atom {
+                return n.to_string();
+            }
+        }
+        for (name, a) in &self.interned {
+            if *a == atom {
+                return name.clone();
+            }
+        }
+        format!("atom-{atom}")
     }
 
     fn advance_incr(&mut self, requestor: u32, property: Atom) {
