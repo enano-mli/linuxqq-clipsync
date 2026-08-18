@@ -357,10 +357,7 @@ impl OwnerThread {
             Event::Error(err) => {
                 // 未检查请求的服务端错误（BadAtom/BadWindow/BadValue 等）会以
                 // 错误事件形式到达——必须暴露出来，否则属性写入失败无声无息
-                log(
-                    "WARN",
-                    &format!("[X11-Owner] X 协议错误: {:?} (seq={})", err, err.raw_sequence()),
-                );
+                log("WARN", &format!("[X11-Owner] X 协议错误: {err:?}"));
             }
             _ => {}
         }
