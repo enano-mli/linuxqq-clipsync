@@ -21,7 +21,7 @@ use x11rb::connection::{Connection, RequestConnection};
 use x11rb::errors::ConnectionError;
 use x11rb::protocol::xproto::{
     AtomEnum, ChangeWindowAttributesAux, ConnectionExt, CreateWindowAux, EventMask, PropMode,
-    Property, WindowClass, SELECTION_NOTIFY_EVENT,
+    Property, SelectionNotifyEvent, WindowClass, SELECTION_NOTIFY_EVENT,
 };
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
