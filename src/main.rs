@@ -183,16 +183,21 @@ fn debug_dump(tag: &str, types: &str, data: &[u8]) {
     );
 }
 
-// png → BMP3（wine CF_DIB 需要）。CLIPSYNC_BMP_CONV=magick 时切回
-// ImageMagick 管道（与旧企微桥行为逐字节一致的保底路径）。
-fn make_bmp(png: &[u8]) -> Option<Vec<u8>> {
+// 图片 → BMP3（wine CF_DIB 需要）。按魔数嗅探真实格式（QQ 会把 JPEG
+// 挂在 image/png 名下）。CLIPSYNC_BMP_CONV=magick 时切回 ImageMagick 管道。
+fn make_bmp(img: &[u8]) -> Option<Vec<u8>> {
     if env::var("CLIPSYNC_BMP_CONV").unwrap_or_default() == "magick" {
-        return magick_filter(&["png:-", "BMP3:-"], png);
+        let input = match convert::sniff_image(img) {
+            Some("image/jpeg") => "jpg:-",
+            Some("image/bmp") => return Some(img.to_vec()),
+            _ => "png:-",
+        };
+        return magick_filter(&[input, "BMP3:-"], img);
     }
-    match convert::png_to_bmp3(png) {
+    match convert::image_to_bmp3(img) {
         Ok(b) => Some(b),
         Err(e) => {
-            log("WARN", &format!("png→bmp: {e}"));
+            log("WARN", &format!("img→bmp: {e}"));
             None
         }
     }
@@ -409,6 +414,16 @@ fn main() {
                 "raw"
             } else {
                 process_mode
+            };
+            // QQ 等客户端在 image/png 名下提供 JPEG 原始字节：
+            // 写 Wayland 时按真实格式纠正 MIME，否则消费端解码失败
+            let sync_mime = if process_mode == "raw" && sync_mime == "image/png" {
+                match convert::sniff_image(&x_data) {
+                    Some(actual) if actual != "image/png" => actual,
+                    _ => sync_mime,
+                }
+            } else {
+                sync_mime
             };
             let current_hash = calc_hash(&x_data, process_mode);
             if current_hash == EMPTY_HASH {

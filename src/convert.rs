@@ -11,10 +11,40 @@ fn composite_white(c: u8, a: u8) -> u8 {
     ((c as u32 * a as u32 + 255 * (255 - a as u32) + 127) / 255) as u8
 }
 
-pub fn png_to_bmp3(png: &[u8]) -> Result<Vec<u8>, String> {
-    let img = image::ImageReader::with_format(Cursor::new(png), ImageFormat::Png)
+/// 按魔数嗅探真实图片格式。QQ 等客户端会把 JPEG 原始字节挂在 image/png
+/// 名下提供（实测 2026-08-19），声明的 MIME 不可信。
+pub fn sniff_image(data: &[u8]) -> Option<&'static str> {
+    if data.starts_with(&[0x89, b'P', b'N', b'G']) {
+        Some("image/png")
+    } else if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if data.starts_with(b"BM") {
+        Some("image/bmp")
+    } else if data.starts_with(b"GIF8") {
+        Some("image/gif")
+    } else if data.len() > 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// 任意（可解码）图片字节 → BMP3。已是 BMP 的原样返回。
+pub fn image_to_bmp3(data: &[u8]) -> Result<Vec<u8>, String> {
+    if data.starts_with(b"BM") {
+        return Ok(data.to_vec());
+    }
+    let fmt = match sniff_image(data) {
+        Some("image/png") => ImageFormat::Png,
+        Some("image/jpeg") => ImageFormat::Jpeg,
+        Some("image/gif") | Some("image/webp") | None => {
+            return Err(format!("无法识别的图片格式: head={:02x?}", &data[..data.len().min(8)]))
+        }
+        _ => return Err("不支持的转换源".to_string()),
+    };
+    let img = image::ImageReader::with_format(Cursor::new(data), fmt)
         .decode()
-        .map_err(|e| format!("png 解码失败: {e}"))?;
+        .map_err(|e| format!("图片解码失败: {e}"))?;
 
     let (w, h) = (img.width(), img.height());
     let rgba = img.to_rgba8();
@@ -34,6 +64,10 @@ pub fn png_to_bmp3(png: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 pub fn bmp_to_png(bmp: &[u8]) -> Result<Vec<u8>, String> {
+    // 防御：若实际已是 PNG（MIME 标错），原样返回
+    if bmp.starts_with(&[0x89, b'P', b'N', b'G']) {
+        return Ok(bmp.to_vec());
+    }
     let img = image::ImageReader::with_format(Cursor::new(bmp), ImageFormat::Bmp)
         .decode()
         .map_err(|e| format!("bmp 解码失败: {e}"))?;
@@ -68,7 +102,7 @@ mod tests {
             // 红/绿/蓝渐变，含 0 与 255 边界
             Rgba([(x * 16) as u8, (y * 32) as u8, 128, 255])
         });
-        let bmp = png_to_bmp3(&png).unwrap();
+        let bmp = image_to_bmp3(&png).unwrap();
         // BMP3 头部：'BM' + 14B 文件头 + 40B BITMAPINFOHEADER
         assert_eq!(&bmp[0..2], b"BM");
         assert_eq!(u32::from_le_bytes(bmp[14..18].try_into().unwrap()), 40);
@@ -87,7 +121,7 @@ mod tests {
         let png = make_png(2, 1, |x, _| {
             if x == 0 { Rgba([0, 0, 0, 128]) } else { Rgba([10, 20, 30, 0]) }
         });
-        let bmp = png_to_bmp3(&png).unwrap();
+        let bmp = image_to_bmp3(&png).unwrap();
         let decoded = image::load_from_memory(&bmp).unwrap().to_rgba8();
         let p0 = decoded.get_pixel(0, 0);
         let p1 = decoded.get_pixel(1, 0);
@@ -98,11 +132,36 @@ mod tests {
     #[test]
     fn bmp3_is_24bpp_no_palette() {
         let png = make_png(4, 4, |x, _| Rgba([(x * 60) as u8, 99, 200, 255]));
-        let bmp = png_to_bmp3(&png).unwrap();
+        let bmp = image_to_bmp3(&png).unwrap();
         let bpp = u16::from_le_bytes(bmp[28..30].try_into().unwrap());
         assert_eq!(bpp, 24);
         // 4px 宽 24bpp → 行 12B，补齐到 4 字节倍数无需填充
         let data_offset = u32::from_le_bytes(bmp[10..14].try_into().unwrap()) as usize;
         assert_eq!(data_offset, 54); // 14 + 40，无调色板
+    }
+
+    #[test]
+    fn qq_style_mislabeled_jpeg() {
+        // QQ 在 image/png 名下提供 JPEG 原始字节——按魔数嗅探解码
+        let img: ImageBuffer<image::Rgb<u8>, Vec<u8>> =
+            ImageBuffer::from_fn(24, 12, |x, _| image::Rgb([(x * 10) as u8, 77, 33]));
+        let mut jpg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(Cursor::new(&mut jpg), 90)
+            .write_image(img.as_raw(), 24, 12, ExtendedColorType::Rgb8)
+            .unwrap();
+        assert_eq!(sniff_image(&jpg), Some("image/jpeg"));
+
+        let bmp = image_to_bmp3(&jpg).unwrap();
+        assert_eq!(&bmp[0..2], b"BM");
+        let decoded = image::load_from_memory(&bmp).unwrap().to_rgba8();
+        assert_eq!(decoded.dimensions(), (24, 12));
+    }
+
+    #[test]
+    fn already_bmp_passthrough() {
+        let png = make_png(4, 4, |_, _| Rgba([1, 2, 3, 255]));
+        let bmp = image_to_bmp3(&png).unwrap();
+        assert_eq!(image_to_bmp3(&bmp).unwrap(), bmp); // BMP 进 BMP 出
+        assert_eq!(bmp_to_png(&png).unwrap(), png); // 伪 bmp（实为 png）直通
     }
 }
