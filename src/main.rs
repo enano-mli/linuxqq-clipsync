@@ -492,6 +492,20 @@ fn main() {
         let types_raw = read_clipboard("wl-paste", &["--list-types"]);
         let types_str = String::from_utf8_lossy(&types_raw);
 
+        // wine 指纹过滤：wine（企微/微信）复制时，xwayland-satellite 会把它的
+        // X11 持有权反向代理成 Wayland 选择（带 wine 专有 target），与 X2W 的
+        // wl-copy 竞争；且 satellite 的文本代理有损（中文变 '?'）。X11 侧已有
+        // wine 的原始数据，W2X 对此类镜像必须跳过，否则会用坏数据覆盖 wine。
+        // 正经 Wayland 应用绝不会提供这些 Windows 风格 target 名。
+        if types_str.contains("Wine Marshalled DataObject")
+            || types_str.contains("WeWork Message")
+            || types_str.contains("WeChat_RichEdit_Format")
+            || types_str.contains("HTML Format")
+            || types_str.contains("Ole Private Data")
+        {
+            continue;
+        }
+
         let (sync_mime, process_mode) =
             // 与 X2W 同理：图像本体优先于 uri-list（临时文件路径）
             if types_str.contains("image/png") {
