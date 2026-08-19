@@ -189,6 +189,7 @@ fn make_bmp(img: &[u8]) -> Option<Vec<u8>> {
     if env::var("CLIPSYNC_BMP_CONV").unwrap_or_default() == "magick" {
         let input = match convert::sniff_image(img) {
             Some("image/jpeg") => "jpg:-",
+            Some("image/gif") => "gif:-",
             Some("image/bmp") => return Some(img.to_vec()),
             _ => "png:-",
         };
@@ -485,7 +486,9 @@ fn main() {
             if let Some(owner) = &owner_for_x2w {
                 if !from_bmp
                     && process_mode == "raw"
-                    && (sync_mime == "image/png" || sync_mime == "image/jpeg")
+                    && (sync_mime == "image/png"
+                        || sync_mime == "image/jpeg"
+                        || sync_mime == "image/gif")
                 {
                     match make_bmp(&write_data) {
                         Some(bmp) => {
@@ -549,6 +552,8 @@ fn main() {
                 ("image/png", "raw")
             } else if types_str.contains("image/jpeg") {
                 ("image/jpeg", "raw")
+            } else if types_str.contains("image/gif") {
+                ("image/gif", "raw")
             } else if types_str.contains("application/x-qt-image")
                 || types_str.contains("text/uri-list")
             {
@@ -626,7 +631,10 @@ fn main() {
                 targets.push(("UTF8_STRING", write_data.clone()));
                 targets.push(("text/plain;charset=utf-8", write_data.clone()));
                 targets.push(("text/plain", write_data.clone()));
-            } else if sync_mime == "image/png" || sync_mime == "image/jpeg" {
+            } else if sync_mime == "image/png"
+                || sync_mime == "image/jpeg"
+                || sync_mime == "image/gif"
+            {
                 targets.push((sync_mime, write_data.clone()));
                 match make_bmp(&write_data) {
                     Some(bmp) => targets.push(("image/bmp", bmp)),

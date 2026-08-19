@@ -8,5 +8,5 @@ xxhash-rust = { version = "0.8.10", features = ["xxh3"] }
 chrono = "0.4.35"
 memfd = "0.6.3"
 libc = "0.2"
-image = { version = "0.25", default-features = false, features = ["png", "bmp", "jpeg"] }
+image = { version = "0.25", default-features = false, features = ["png", "bmp", "jpeg", "gif"] }
 x11rb = "0.13"

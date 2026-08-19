@@ -37,8 +37,13 @@ pub fn image_to_bmp3(data: &[u8]) -> Result<Vec<u8>, String> {
     let fmt = match sniff_image(data) {
         Some("image/png") => ImageFormat::Png,
         Some("image/jpeg") => ImageFormat::Jpeg,
-        Some("image/gif") | Some("image/webp") | None => {
-            return Err(format!("无法识别的图片格式: head={:02x?}", &data[..data.len().min(8)]))
+        // GIF 取第一帧（CF_DIB/BMP 本就是静态格式，与 Windows 行为一致）
+        Some("image/gif") => ImageFormat::Gif,
+        Some("image/webp") | None => {
+            return Err(format!(
+                "无法识别的图片格式: head={:02x?}",
+                &data[..data.len().min(8)]
+            ))
         }
         _ => return Err("不支持的转换源".to_string()),
     };
@@ -155,6 +160,28 @@ mod tests {
         assert_eq!(&bmp[0..2], b"BM");
         let decoded = image::load_from_memory(&bmp).unwrap().to_rgba8();
         assert_eq!(decoded.dimensions(), (24, 12));
+    }
+
+    #[test]
+    fn gif_takes_first_frame() {
+        // 两帧 GIF（红→蓝）：BMP 取第一帧（红），与 Windows CF_DIB 静态语义一致
+        let f1: ImageBuffer<Rgba<u8>, Vec<u8>> =
+            ImageBuffer::from_pixel(8, 8, Rgba([255, 0, 0, 255]));
+        let f2: ImageBuffer<Rgba<u8>, Vec<u8>> =
+            ImageBuffer::from_pixel(8, 8, Rgba([0, 0, 255, 255]));
+        let mut gif = Vec::new();
+        {
+            let mut enc = image::codecs::gif::GifEncoder::new(Cursor::new(&mut gif));
+            enc.encode_frame(image::Frame::new(f1)).unwrap();
+            enc.encode_frame(image::Frame::new(f2)).unwrap();
+        }
+        assert_eq!(sniff_image(&gif), Some("image/gif"));
+
+        let bmp = image_to_bmp3(&gif).unwrap();
+        let decoded = image::load_from_memory(&bmp).unwrap().to_rgba8();
+        assert_eq!(decoded.dimensions(), (8, 8));
+        assert_eq!(decoded.get_pixel(4, 4)[0], 255, "应为第一帧（红色）");
+        assert_eq!(decoded.get_pixel(4, 4)[2], 0);
     }
 
     #[test]
