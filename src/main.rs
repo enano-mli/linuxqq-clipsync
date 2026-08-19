@@ -341,8 +341,9 @@ fn main() {
                 "W2X 写入模式: xclip（owner 启动失败，自动回退）"
             },
         );
-        owner
+        owner.map(std::sync::Arc::new)
     };
+    let owner_for_x2w = x11_owner.clone();
 
     // ==========================================
     // X2W 线程
@@ -410,7 +411,8 @@ fn main() {
             } else {
                 x_data
             };
-            let process_mode = if process_mode == "bmp" {
+            let from_bmp = process_mode == "bmp";
+            let process_mode = if from_bmp {
                 "raw"
             } else {
                 process_mode
@@ -475,6 +477,26 @@ fn main() {
             }
 
             write_clipboard("wl-copy", &["-t", sync_mime], &write_data);
+
+            // X2W 镜像图片后，W2X 会因 hash 命中跳过断言，X11 侧仍是原持有者
+            // （QQ 等不提供 bmp）→ wine 拿不到 CF_DIB。因此 X2W 对图片类内容
+            // 主动用 owner 接管 X11 并补 bmp（企微自身复制的 bmp 除外——
+            // wine 本来就是持有者，无需打扰）。
+            if let Some(owner) = &owner_for_x2w {
+                if !from_bmp
+                    && process_mode == "raw"
+                    && (sync_mime == "image/png" || sync_mime == "image/jpeg")
+                {
+                    match make_bmp(&write_data) {
+                        Some(bmp) => {
+                            log("X2W", "owner 接管 X11 并补 image/bmp（供 wine）");
+                            let m = sync_mime;
+                            let _ = owner.assert(vec![(m, write_data.clone()), ("image/bmp", bmp)]);
+                        }
+                        None => log("WARN", "X2W 补 bmp 失败，X11 维持原持有者"),
+                    }
+                }
+            }
         }
     });
 
@@ -604,11 +626,11 @@ fn main() {
                 targets.push(("UTF8_STRING", write_data.clone()));
                 targets.push(("text/plain;charset=utf-8", write_data.clone()));
                 targets.push(("text/plain", write_data.clone()));
-            } else if sync_mime == "image/png" {
-                targets.push(("image/png", write_data.clone()));
+            } else if sync_mime == "image/png" || sync_mime == "image/jpeg" {
+                targets.push((sync_mime, write_data.clone()));
                 match make_bmp(&write_data) {
                     Some(bmp) => targets.push(("image/bmp", bmp)),
-                    None => log("WARN", "png→bmp 转换失败，本次仅提供 image/png"),
+                    None => log("WARN", &format!("{sync_mime}→bmp 转换失败，仅提供原格式")),
                 }
             } else {
                 targets.push((sync_mime, write_data.clone()));
