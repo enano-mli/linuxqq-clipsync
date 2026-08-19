@@ -183,8 +183,10 @@ impl OwnerThread {
         t.atom_wm_class = t.intern("WM_CLASS")?;
         t.dummy_prop = t.intern("CLIPSYNC_TS")?;
 
-        // INCR 分块：不超过服务器最大请求长度，留协议头余量
-        t.chunk = t.conn.maximum_request_bytes().saturating_sub(512).min(1 << 20) & !3usize;
+        // INCR 分块阈值：尽量用满服务器最大请求长度（BIG-REQUESTS 通常给到
+        // 很大），让常规截图走单次属性直传、完全绕开 INCR 协议交互
+        t.chunk = t.conn.maximum_request_bytes().saturating_sub(512) & !3usize;
+        log("INIT", &format!("[X11-Owner] 单次直传上限 {} 字节", t.chunk));
         Some(t)
     }
 
@@ -456,6 +458,25 @@ impl OwnerThread {
                 if ok { property } else { 0 },
                 e.time,
             );
+            return;
+        }
+
+        // wine 直连过滤：wine 可能凭缓存的格式信息跳过 TARGETS 直接请求
+        // image/png（拿到会映射成应用不认的自定义 PNG 格式）或 text/uri-list
+        // （HDROP 文件粘贴）。bmp 可用时对 wine 拒绝这两者，逼其回退 bmp。
+        if has_dual
+            && self.requestor_is_wine(e.requestor)
+            && (e.target == self.atom_png || e.target == self.atom_urilist)
+        {
+            log(
+                "X11-Owner",
+                &format!(
+                    "wine 直连请求 {} 已拒绝（回退 bmp）→ 0x{:x}",
+                    self.atom_name(e.target),
+                    e.requestor
+                ),
+            );
+            self.notify(e.requestor, e.selection, e.target, 0, e.time);
             return;
         }
 
