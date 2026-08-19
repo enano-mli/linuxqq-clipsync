@@ -118,6 +118,7 @@ struct OwnerThread {
     atom_incr: Atom,
     atom_png: Atom,
     atom_bmp: Atom,
+    atom_jpeg: Atom,
     atom_urilist: Atom,
     atom_wm_class: Atom,
     interned: HashMap<String, Atom>,
@@ -163,6 +164,7 @@ impl OwnerThread {
             atom_incr: 0,
             atom_png: 0,
             atom_bmp: 0,
+            atom_jpeg: 0,
             atom_urilist: 0,
             atom_wm_class: 0,
             interned: HashMap::new(),
@@ -179,6 +181,7 @@ impl OwnerThread {
         t.atom_incr = t.intern("INCR")?;
         t.atom_png = t.intern("image/png")?;
         t.atom_bmp = t.intern("image/bmp")?;
+        t.atom_jpeg = t.intern("image/jpeg")?;
         t.atom_urilist = t.intern("text/uri-list")?;
         t.atom_wm_class = t.intern("WM_CLASS")?;
         t.dummy_prop = t.intern("CLIPSYNC_TS")?;
@@ -398,10 +401,10 @@ impl OwnerThread {
                 p.atoms.clone(),
                 p.acquired_at,
                 p.data.get(&e.target).cloned(),
-                p.data.contains_key(&self.atom_png) && p.data.contains_key(&self.atom_bmp),
+                p.data.contains_key(&self.atom_bmp),
             )
         });
-        let Some((atoms_list, acquired_at, target_data, has_dual)) = payload_info else {
+        let Some((atoms_list, acquired_at, target_data, has_bmp)) = payload_info else {
             // 已不持有：拒绝
             self.notify(e.requestor, e.selection, e.target, 0, e.time);
             return;
@@ -415,13 +418,15 @@ impl OwnerThread {
             // 因此对 wine 隐藏 png 和 uri-list，只让它看到 bmp 和文本 target
             // （仅在 bmp 确实可用时过滤，否则保留 png 兜底）。
             let mut atoms = atoms_list;
-            if has_dual && self.requestor_is_wine(e.requestor) {
+            if has_bmp && self.requestor_is_wine(e.requestor) {
                 let before = atoms.len();
-                atoms.retain(|a| *a != self.atom_png && *a != self.atom_urilist);
+                atoms.retain(|a| {
+                    *a != self.atom_png && *a != self.atom_jpeg && *a != self.atom_urilist
+                });
                 log(
                     "X11-Owner",
                     &format!(
-                        "wine 请求方 0x{:x}：TARGETS 过滤 {}→{}（隐藏 png/uri-list，保 bmp）",
+                        "wine 请求方 0x{:x}：TARGETS 过滤 {}→{}（隐藏 png/jpeg/uri-list，保 bmp）",
                         e.requestor,
                         before,
                         atoms.len()
@@ -462,11 +467,14 @@ impl OwnerThread {
         }
 
         // wine 直连过滤：wine 可能凭缓存的格式信息跳过 TARGETS 直接请求
-        // image/png（拿到会映射成应用不认的自定义 PNG 格式）或 text/uri-list
-        // （HDROP 文件粘贴）。bmp 可用时对 wine 拒绝这两者，逼其回退 bmp。
-        if has_dual
+        // image/png / image/jpeg（拿到会映射成应用不认的自定义格式）或
+        // text/uri-list（HDROP 文件粘贴）。bmp 可用时对 wine 拒绝这三者，
+        // 逼其回退 bmp。
+        if has_bmp
             && self.requestor_is_wine(e.requestor)
-            && (e.target == self.atom_png || e.target == self.atom_urilist)
+            && (e.target == self.atom_png
+                || e.target == self.atom_jpeg
+                || e.target == self.atom_urilist)
         {
             log(
                 "X11-Owner",
