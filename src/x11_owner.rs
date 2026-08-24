@@ -16,9 +16,11 @@ use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::errors::ConnectionError;
+use x11rb::protocol::ErrorKind;
 use x11rb::protocol::xproto::{
     AtomEnum, ChangeWindowAttributesAux, ConnectionExt, CreateWindowAux, EventMask, PropMode,
     Property, SelectionNotifyEvent, WindowClass, SELECTION_NOTIFY_EVENT,
@@ -27,6 +29,11 @@ use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
 
 type Atom = u32;
+
+/// INCR 传输无进度多久后放弃：请求方窗口中途销毁后不再有 PropertyNotify，
+/// 靠超时丢弃防止大图缓冲在 pending 中永久驻留。正常请求方逐块取数的
+/// 间隔远小于此值
+const INCR_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 enum OwnerCmd {
     /// 接管 CLIPBOARD 所有权并服务给定 targets（名称 → 数据）
@@ -45,6 +52,8 @@ struct PendingIncr {
     target_type: Atom,
     data: Vec<u8>,
     offset: usize,
+    /// 上次取数信号（PropertyNotify DELETE）时间，超时清扫用
+    last_progress: Instant,
 }
 
 pub struct X11Owner {
@@ -265,6 +274,9 @@ impl OwnerThread {
                 // 短暂退避避免错误风暴
                 thread::sleep(std::time::Duration::from_millis(50));
             }
+            // INCR 清扫：死窗口的传输永远等不到 PropertyNotify，
+            // poll 的 60 秒超时保证这里最迟约每 60 秒执行一次
+            self.sweep_stale_incr();
             // 3) 阻塞等待 X socket 或唤醒管道（关键：应答延迟必须为毫秒级，
             //    xclip 等客户端等待 SelectionNotify 的窗口只有几十毫秒）
             let mut fds = [
@@ -319,9 +331,13 @@ impl OwnerThread {
     }
 
     fn take_ownership(&mut self, ts: u32) {
-        if let Some(p) = self.payload.as_mut() {
-            p.acquired_at = ts;
-        }
+        // 若 SelectionClear 抢在哑属性的 PropertyNotify 之前到达（payload 已
+        // 清空），放弃本次接管——不能在无数据可服务的状态下抢所有权，
+        // 否则会成为拒绝一切请求的空持有者
+        let Some(p) = self.payload.as_mut() else {
+            return;
+        };
+        p.acquired_at = ts;
         if self
             .conn
             .set_selection_owner(self.win, self.atom_clipboard, ts)
@@ -378,6 +394,10 @@ impl OwnerThread {
                 // 未检查请求的服务端错误（BadAtom/BadWindow/BadValue 等）会以
                 // 错误事件形式到达——必须暴露出来，否则属性写入失败无声无息
                 log("WARN", &format!("[X11-Owner] X 协议错误: {err:?}"));
+                // BadWindow：请求方窗口已销毁，其未完成的 INCR 传输立即作废
+                if err.error_kind == ErrorKind::Window {
+                    self.drop_incr_for(err.bad_value, "BadWindow");
+                }
             }
             _ => {}
         }
@@ -547,6 +567,7 @@ impl OwnerThread {
                     target_type: e.target,
                     data,
                     offset: 0,
+                    last_progress: Instant::now(),
                 });
                 self.notify(e.requestor, e.selection, e.target, property, e.time);
             } else {
@@ -609,6 +630,7 @@ impl OwnerThread {
             return;
         };
         let p = &mut self.pending[idx];
+        p.last_progress = Instant::now();
         let end = (p.offset + self.chunk).min(p.data.len());
         let bytes = p.data[p.offset..end].to_vec();
         let target_type = p.target_type;
@@ -621,6 +643,38 @@ impl OwnerThread {
                 log("X11-Owner", "INCR 传输完成");
             }
             self.pending.remove(idx);
+        }
+    }
+
+    /// INCR 超时清扫：见 INCR_STALL_TIMEOUT
+    fn sweep_stale_incr(&mut self) {
+        let before = self.pending.len();
+        self.pending
+            .retain(|p| p.last_progress.elapsed() < INCR_STALL_TIMEOUT);
+        if self.pending.len() != before {
+            log(
+                "WARN",
+                &format!(
+                    "[X11-Owner] INCR 超时丢弃 {} 条传输（请求方超过 {} 秒无取数）",
+                    before - self.pending.len(),
+                    INCR_STALL_TIMEOUT.as_secs()
+                ),
+            );
+        }
+    }
+
+    /// 丢弃指定请求方窗口的全部 INCR 传输（窗口已销毁等场景）
+    fn drop_incr_for(&mut self, requestor: u32, reason: &str) {
+        let before = self.pending.len();
+        self.pending.retain(|p| p.requestor != requestor);
+        if self.pending.len() != before {
+            log(
+                "WARN",
+                &format!(
+                    "[X11-Owner] INCR 丢弃 0x{requestor:x} 的 {} 条传输（{reason}）",
+                    before - self.pending.len()
+                ),
+            );
         }
     }
 
